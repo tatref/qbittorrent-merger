@@ -1,5 +1,8 @@
 use std::io::prelude::*;
 
+// Test tool to corrupt files
+// You probably don't want to use this!
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<_> = std::env::args().collect();
     if args.len() < 4 {

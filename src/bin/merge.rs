@@ -1,3 +1,7 @@
+//
+// Merge identical files from different torrents via qBittorrent API
+//
+
 use itertools::Itertools;
 use std::collections::HashSet;
 use std::convert::TryInto;
