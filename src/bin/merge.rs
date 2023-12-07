@@ -7,6 +7,7 @@ use std::fs::OpenOptions;
 use std::io::{prelude::*, BufReader, BufWriter};
 use std::{collections::HashMap, fs::File};
 
+use log::{debug, error, info, warn};
 use qbit_rs::model::{Preferences, TorrentContent, TorrentProperty};
 use qbit_rs::{
     model::{Credential, GetTorrentListArg, PieceState},
@@ -15,6 +16,7 @@ use qbit_rs::{
 use sha1::{Digest, Sha1};
 
 struct Torrent {
+    hash: String,
     properties: TorrentProperty,
     content: Vec<TorrentContent>,
     pieces_states: Vec<PieceState>,
@@ -34,6 +36,7 @@ impl Torrent {
         let content = api.get_torrent_contents(hash, None).await?;
 
         let torrent = Torrent {
+            hash: hash.to_owned(),
             properties,
             content,
             pieces_states,
@@ -58,6 +61,7 @@ fn get_sha1(data: &[u8]) -> [u8; 20] {
     sha1
 }
 
+/// A chunk of a file
 #[derive(Debug, Copy, Clone)]
 struct FileBlock {
     offset: u64,
@@ -71,7 +75,9 @@ impl FileBlock {
 
 #[derive(Debug, Copy, Clone)]
 enum Piece {
+    /// Fake piece, not aligned
     VirtualPiece(VirtualPiece),
+    /// A real piece from a torrent, starting offset is aligned on `piece_size`
     TorrentPiece(TorrentPiece),
 }
 
@@ -108,7 +114,6 @@ fn piece_to_file_block(
             for f in &torrent.content {
                 if offset < f.size {
                     let file_start = piece.idx as u64 * piece.piece_size - offset;
-                    dbg!(file_start);
                     // piece is inside file
                     let file_block = FileBlock {
                         offset,
@@ -206,7 +211,7 @@ fn get_read_file(
     } else {
         format!("{}/{}", preferences.temp_path.as_ref().unwrap(), path)
     };
-    //let path = format!("{}/{}", torrent_property.save_path.as_ref().unwrap(), path);
+
     let f = OpenOptions::new().read(true).open(path)?;
     Ok(BufReader::new(f))
 }
@@ -221,9 +226,7 @@ fn get_write_file(
     } else {
         format!("{}/{}", preferences.temp_path.as_ref().unwrap(), path)
     };
-    //let path = format!("{}/{}", torrent_property.save_path.as_ref().unwrap(), path);
 
-    dbg!(&path);
     let f = OpenOptions::new().write(true).open(&path)?;
     Ok(BufWriter::new(f))
 }
@@ -328,9 +331,11 @@ fn get_file_offset(
 }
 
 async fn work() -> Result<(), Box<dyn std::error::Error>> {
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn")).init();
+
     let args: Vec<_> = std::env::args().collect();
     if args.len() < 3 {
-        eprintln!("Usage: {} <complete hash> <incomplete hash>", args[0]);
+        error!("Usage: {} <complete hash> <incomplete hash>", args[0]);
         std::process::exit(1);
     }
 
@@ -338,7 +343,7 @@ async fn work() -> Result<(), Box<dyn std::error::Error>> {
     let api = Qbit::new("http://localhost:8080", credential);
 
     let version = api.get_version().await?;
-    dbg!(version);
+    info!("qBittorrent version: {}", version);
     let preferences = api.get_preferences().await.unwrap();
     let src_hash = &args[1]; // completed torrent
     let dst_hash = &args[2]; // incomplete torrent
@@ -346,106 +351,112 @@ async fn work() -> Result<(), Box<dyn std::error::Error>> {
     // TODO: api.pause_torrents(hashes)
     let src_torrent = Torrent::new(&api, src_hash).await?;
     let dst_torrent = Torrent::new(&api, dst_hash).await?;
+    api.pause_torrents(&[dst_torrent.hash.clone()]).await?;
 
     let mut unavailable_pieces = 0;
-    let mut data_outside_fileblock = 0;
+    let mut data_outside_file_block = 0;
 
-    dbg!(src_torrent.properties.piece_size.unwrap());
-    println!("src content:");
+    debug!(
+        "src_torrent.piece_size={}",
+        src_torrent.properties.piece_size.unwrap()
+    );
+    info!("src content:");
     for f in &src_torrent.content {
-        dbg!(f.size, &f.name);
+        info!("{:10} {}", f.size, &f.name);
     }
-    dbg!(dst_torrent.properties.piece_size.unwrap());
-    println!("dst content:");
+    debug!(
+        "dst_torrent.piece_size={}",
+        dst_torrent.properties.piece_size.unwrap()
+    );
+    info!("dst content:");
     for f in &dst_torrent.content {
-        dbg!(f.size, &f.name);
+        info!("{:10} {}", f.size, &f.name);
     }
 
     let same_files = find_same_size_files(&src_torrent, &dst_torrent);
-    dbg!(&same_files);
+    info!("same files: {:?}", &same_files);
 
-    let _src_filename = &same_files[0].0[0].clone(); // recomputed from torrent content later
-    let dst_filename = &same_files[0].1[0].clone();
+    //let _src_filename = &same_files[0].0[0].clone(); // recomputed from torrent content later
+    //let dst_filename = &same_files[0].1[0].clone();
 
-    let missing_pieces = get_missing_pieces(&dst_torrent, dst_filename);
-    dbg!(&missing_pieces);
-    dbg!(missing_pieces.len());
+    for same_file in &same_files {
+        let dst_filename = &same_file.1[0];
+        info!("Working on {}", dst_filename);
 
-    'missing_pieces_loop: for &missing_piece_idx in &missing_pieces[0..] {
-        let dst_piece = TorrentPiece {
-            idx: missing_piece_idx,
-            piece_size: dst_torrent.properties.piece_size.unwrap() as u64,
-        };
-        dbg!("missing piece:", dst_piece);
+        let missing_pieces = get_missing_pieces(&dst_torrent, dst_filename);
+        debug!(
+            "{} missing_pieces: {:?}",
+            missing_pieces.len(),
+            &missing_pieces
+        );
 
-        let missing_hash = dst_torrent.pieces_hashes[dst_piece.idx];
+        'missing_pieces_loop: for &missing_piece_idx in &missing_pieces[0..] {
+            let dst_piece = TorrentPiece {
+                idx: missing_piece_idx,
+                piece_size: dst_torrent.properties.piece_size.unwrap() as u64,
+            };
+            info!("Working on missing piece: {:?}", dst_piece);
 
-        let (filename, dst_file_block) =
-            piece_to_file_block(&dst_torrent, &Piece::TorrentPiece(dst_piece)).unwrap();
-        dbg!(&filename, &dst_file_block);
+            let missing_hash = dst_torrent.pieces_hashes[dst_piece.idx];
 
-        let src_filename = convert_filename(&same_files, &filename).unwrap();
-        dbg!(&filename, &src_filename);
-        let src_pieces =
-            file_block_to_pieces(&src_torrent, &src_filename, &dst_file_block).unwrap();
-        dbg!(&src_pieces);
+            let (filename, dst_file_block) =
+                piece_to_file_block(&dst_torrent, &Piece::TorrentPiece(dst_piece)).unwrap();
+            info!("filename: {}, fileblock: {:?}", &filename, &dst_file_block);
 
-        for src_piece in &src_pieces {
-            let src_piece_is_available = src_torrent.piece_is_downloaded(&src_piece);
-            dbg!(src_piece_is_available);
-            if !src_piece_is_available {
-                println!("WARNING: Skipping unavailable piece: {:?}", src_piece);
-                unavailable_pieces += 1;
+            let src_filename = convert_filename(&same_files, &filename).unwrap();
+            debug!("dst/src filenames: {} / {}", &filename, &src_filename);
+            let src_pieces =
+                file_block_to_pieces(&src_torrent, &src_filename, &dst_file_block).unwrap();
+            debug!("src_pieces: {:?}", &src_pieces);
+
+            for src_piece in &src_pieces {
+                let src_piece_is_available = src_torrent.piece_is_downloaded(&src_piece);
+                if !src_piece_is_available {
+                    warn!("Skipping unavailable piece: {:?}", src_piece);
+                    unavailable_pieces += 1;
+                    continue 'missing_pieces_loop;
+                }
+            }
+
+            let mut src_f = get_read_file(&preferences, &src_torrent.properties, &src_filename)
+                .expect(&format!("Can't open file {:?}", &src_filename));
+            let virt_src_piece = TorrentPiece::merge(&src_pieces).unwrap();
+            debug!("virt_src_piece: {:?}", virt_src_piece);
+            let (_src_filename, virt_src_file_block) =
+                piece_to_file_block(&src_torrent, &Piece::VirtualPiece(virt_src_piece)).unwrap();
+            debug!("virt_src_file_block: {:?}", virt_src_file_block);
+
+            if virt_src_file_block.contains(&dst_file_block) {
+                // OK!
+            } else {
+                error!("Can't get data outside file block");
+                error!("Can't get data outside file block");
+                data_outside_file_block += 1;
                 continue 'missing_pieces_loop;
             }
-        }
 
-        let mut src_f = get_read_file(&preferences, &src_torrent.properties, &src_filename)
-            .expect(&format!("Can't open file {:?}", &src_filename));
-        let virt_src_piece = TorrentPiece::merge(&src_pieces).unwrap();
-        dbg!(&virt_src_piece);
-        let (_src_filename, virt_src_file_block) =
-            piece_to_file_block(&src_torrent, &Piece::VirtualPiece(virt_src_piece)).unwrap();
-        dbg!(virt_src_file_block);
+            let data = read_piece(&mut src_f, virt_src_file_block).expect("Can't read piece");
+            let data_offset = (dst_file_block.offset - virt_src_file_block.offset) as usize; // is positive
+            let data = &data[data_offset..(data_offset + dst_file_block.size as usize)];
+            let computed_hash = get_sha1(data);
 
-        if virt_src_file_block.contains(&dst_file_block) {
-            // OK!
-        } else {
-            eprintln!("Can't get data outside file block");
-            dbg!(dst_file_block.offset >= virt_src_file_block.offset);
-            dbg!(
-                dst_file_block.offset + dst_file_block.size
-                    <= virt_src_file_block.offset + virt_src_file_block.size
-            );
-            dbg!(dst_file_block.offset + dst_file_block.size);
-            dbg!(virt_src_file_block.offset + virt_src_file_block.size);
-            panic!("Can't get data outside file block");
-            data_outside_fileblock += 1;
-            continue 'missing_pieces_loop;
-        }
-
-        let data = read_piece(&mut src_f, virt_src_file_block).expect("Can't read piece");
-        let data_offset = (dst_file_block.offset - virt_src_file_block.offset) as usize; // is positive
-        let data = &data[data_offset..(data_offset + dst_file_block.size as usize)];
-        let computed_hash = get_sha1(data);
-
-        if computed_hash == missing_hash {
-            println!("hashes match!");
-            println!("Writing to {}", dst_filename);
-            let mut dst_f = get_write_file(&preferences, &dst_torrent.properties, dst_filename)
-                .expect(&format!("Can't open file {:?}", &dst_filename));
-            write_piece(&mut dst_f, dst_file_block, &data).expect("Unable to write file");
-            println!("wrote to {}", dst_filename);
-        } else {
-            panic!("hashes don't match");
+            if computed_hash == missing_hash {
+                info!("hashes match!");
+                debug!("Writing to {}", dst_filename);
+                let mut dst_f = get_write_file(&preferences, &dst_torrent.properties, dst_filename)
+                    .expect(&format!("Can't open file {:?}", &dst_filename));
+                write_piece(&mut dst_f, dst_file_block, &data).expect("Unable to write file");
+            } else {
+                warn!("hashes don't match");
+            }
         }
     }
 
-    println!("Unavailable pieces: {}", unavailable_pieces);
-    println!("Data outside fileblock: {}", data_outside_fileblock);
+    info!("Unavailable pieces: {}", unavailable_pieces);
+    info!("Data outside file block: {}", data_outside_file_block);
 
-    println!("Please recheck torrent");
-    println!("Zee end");
+    info!("Rechecking torrent...");
+    api.recheck_torrents(&[dst_torrent.hash.clone()]).await?;
 
     Ok(())
 }
