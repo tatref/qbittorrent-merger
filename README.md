@@ -18,7 +18,7 @@ cargo build --release
 
 ## Get torrent hashes from qBittorrent
 
-![qbittorrent_hash](doc\qbittorrent_hash.PNG)
+![qbittorrent_hash](doc/qbittorrent_hash.PNG)
 
 You need hashes from at least two torrents: one will be used as source, the other as destination.
 
@@ -28,7 +28,7 @@ Piece hashes are checked before copying data to files, so mismatching source/des
 
 Enable the API, and enable auth bypass for localhost (password is not handled yet)
 
-![qbittorrent_api](doc\qbittorrent_api.PNG)
+![qbittorrent_api](doc/qbittorrent_api.PNG)
 
 ## Run the tool
 
