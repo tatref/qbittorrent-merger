@@ -42,7 +42,7 @@ impl Torrent {
         Ok(torrent)
     }
 
-    fn piece_is_downloaded(&self, piece: &Piece) -> bool {
+    fn piece_is_downloaded(&self, piece: &TorrentPiece) -> bool {
         match self.pieces_states[piece.idx] {
             PieceState::Downloaded => true,
             _ => false,
@@ -63,20 +63,50 @@ struct FileBlock {
     offset: u64,
     size: u64,
 }
+impl FileBlock {
+    fn contains(&self, other: &Self) -> bool {
+        self.offset <= other.offset && self.offset + self.size >= other.offset + other.size
+    }
+}
 
 #[derive(Debug, Copy, Clone)]
-struct Piece {
+enum Piece {
+    VirtualPiece(VirtualPiece),
+    TorrentPiece(TorrentPiece),
+}
+
+#[derive(Debug, Copy, Clone)]
+struct VirtualPiece {
+    offset: usize,
+    piece_size: u64,
+}
+
+#[derive(Debug, Copy, Clone)]
+struct TorrentPiece {
     idx: usize,
     piece_size: u64,
+}
+impl TorrentPiece {
+    /// Merge multiple consecutive pieces into one big virtual piece
+    fn merge(list: &[TorrentPiece]) -> Option<TorrentPiece> {
+        let first_piece = list.get(0)?;
+        // TODO: handle errors
+        Some(TorrentPiece {
+            idx: first_piece.idx / list.len(),
+            piece_size: list.len() as u64 * first_piece.piece_size,
+        })
+    }
 }
 
 fn piece_to_file_block(
     torrent: &Torrent,
-    piece: &Piece,
+    piece: &TorrentPiece,
 ) -> Result<(String, FileBlock), Box<dyn std::error::Error>> {
     let mut offset = piece.idx as u64 * piece.piece_size;
     for f in &torrent.content {
         if offset < f.size {
+            let file_start = piece.idx as u64 * piece.piece_size - offset;
+            dbg!(file_start);
             // piece is inside file
             let file_block = FileBlock {
                 offset,
@@ -92,11 +122,11 @@ fn piece_to_file_block(
     Err("Piece outside of torrent".into())
 }
 
-fn file_block_to_piece(
+fn file_block_to_pieces(
     torrent: &Torrent,
     path: &str,
     file_block: &FileBlock,
-) -> Result<Vec<Piece>, Box<dyn std::error::Error>> {
+) -> Result<Vec<TorrentPiece>, Box<dyn std::error::Error>> {
     let piece_size = torrent.properties.piece_size.unwrap() as u64;
     let mut offset = 0;
     for f in &torrent.content {
@@ -110,8 +140,8 @@ fn file_block_to_piece(
                 //let end_idx = ((offset + file_block.size) / piece_size) as usize + 1; // TODO: offset+1? offset+block_size-1?
                 let end_idx = ((offset + file_block.size).div_ceil(piece_size)) as usize;
 
-                let result: Vec<Piece> = (start_idx..end_idx)
-                    .map(|idx| Piece { idx, piece_size })
+                let result: Vec<TorrentPiece> = (start_idx..end_idx)
+                    .map(|idx| TorrentPiece { idx, piece_size })
                     .collect();
 
                 return Ok(result);
@@ -176,13 +206,10 @@ fn get_write_file(
     Ok(BufWriter::new(f))
 }
 
-fn write_piece(
-    f: &mut BufWriter<File>,
-    file_block: FileBlock,
-    data: &[u8],
-) -> std::io::Result<usize> {
+fn write_piece(f: &mut BufWriter<File>, file_block: FileBlock, data: &[u8]) -> std::io::Result<()> {
     f.seek(std::io::SeekFrom::Start(file_block.offset))?;
-    f.write(data)
+    f.write(data)?;
+    f.flush()
 }
 
 fn read_piece(f: &mut BufReader<File>, file_block: FileBlock) -> std::io::Result<Vec<u8>> {
@@ -279,24 +306,34 @@ fn get_file_offset(
 }
 
 async fn work() -> Result<(), Box<dyn std::error::Error>> {
+    let args: Vec<_> = std::env::args().collect();
+    if args.len() < 3 {
+        eprintln!("Usage: {} <complete hash> <incomplete hash>", args[0]);
+        std::process::exit(1);
+    }
+
     let credential = Credential::new("admin", "");
     let api = Qbit::new("http://localhost:8080", credential);
 
     let version = api.get_version().await?;
     dbg!(version);
-
     let preferences = api.get_preferences().await.unwrap();
+    let src_hash = &args[1]; // completed torrent
+    let dst_hash = &args[2]; // incomplete torrent
 
-    let src_hash = "9ddec20aec74729ddd100b3f60bfb9a87a5ee3f0";
-    let dst_hash = "3617e650eadd9372c44c8b73b0b95381dd100192";
-
+    // TODO: api.pause_torrents(hashes)
     let src_torrent = Torrent::new(&api, src_hash).await?;
     let dst_torrent = Torrent::new(&api, dst_hash).await?;
 
+    let mut unavailable_pieces = 0;
+    let mut data_outside_fileblock = 0;
+
+    dbg!(src_torrent.properties.piece_size.unwrap());
     println!("src content:");
     for f in &src_torrent.content {
         dbg!(f.size, &f.name);
     }
+    dbg!(dst_torrent.properties.piece_size.unwrap());
     println!("dst content:");
     for f in &dst_torrent.content {
         dbg!(f.size, &f.name);
@@ -312,10 +349,8 @@ async fn work() -> Result<(), Box<dyn std::error::Error>> {
     dbg!(&missing_pieces);
     dbg!(missing_pieces.len());
 
-    assert_eq!(missing_pieces.len(), 4);
-
-    for &missing_piece_idx in &missing_pieces[1..] {
-        let dst_piece = Piece {
+    'missing_pieces_loop: for &missing_piece_idx in &missing_pieces[0..] {
+        let dst_piece = TorrentPiece {
             idx: missing_piece_idx,
             piece_size: dst_torrent.properties.piece_size.unwrap() as u64,
         };
@@ -328,50 +363,63 @@ async fn work() -> Result<(), Box<dyn std::error::Error>> {
 
         let src_filename = convert_filename(&same_files, &filename).unwrap();
         dbg!(&filename, &src_filename);
-        let src_pieces = file_block_to_piece(&src_torrent, &src_filename, &dst_file_block).unwrap();
+        let src_pieces =
+            file_block_to_pieces(&src_torrent, &src_filename, &dst_file_block).unwrap();
         dbg!(&src_pieces);
 
         for src_piece in &src_pieces {
             let src_piece_is_available = src_torrent.piece_is_downloaded(&src_piece);
             dbg!(src_piece_is_available);
-
-            dbg!(&src_piece);
-
-            let mut src_f = get_read_file(&preferences, &src_torrent.properties, &src_filename)
-                .expect(&format!("Can't open file {:?}", &src_filename));
-            let (_src_filename, src_file_block) =
-                piece_to_file_block(&src_torrent, &src_piece).unwrap();
-
-            dbg!(src_file_block);
-
-            if dst_file_block.offset >= src_file_block.offset
-                && dst_file_block.offset + dst_file_block.size
-                    <= src_file_block.offset + src_file_block.size
-            {
-                // OK!
-            } else {
-                panic!("Can't get data outside file block");
-            }
-
-            let data = read_piece(&mut src_f, src_file_block).expect("Can't read piece");
-            let data_offset = (dst_file_block.offset - src_file_block.offset) as usize; // is positive
-            let data = &data[data_offset..(data_offset + dst_file_block.size as usize)];
-            let computed_hash = get_sha1(data);
-
-            if computed_hash == missing_hash {
-                println!("hashes match!");
-                println!("Writing to {}", dst_filename);
-                let mut dst_f = get_write_file(&preferences, &dst_torrent.properties, dst_filename)
-                    .expect(&format!("Can't open file {:?}", &dst_filename));
-                //write_piece(&mut dst_f, dst_file_block, &data).expect("Unable to write file");
-                println!("wrote to {}", dst_filename);
-            } else {
-                panic!("hashes don't match");
+            if !src_piece_is_available {
+                println!("WARNING: Skipping unavailable piece: {:?}", src_piece);
+                unavailable_pieces += 1;
+                continue 'missing_pieces_loop;
             }
         }
 
-        break;
+        let mut src_f = get_read_file(&preferences, &src_torrent.properties, &src_filename)
+            .expect(&format!("Can't open file {:?}", &src_filename));
+        let virt_src_piece = TorrentPiece::merge(&src_pieces).unwrap();
+        dbg!(&virt_src_piece);
+        let (_src_filename, virt_src_file_block) =
+            piece_to_file_block(&src_torrent, &virt_src_piece).unwrap();
+        dbg!(virt_src_file_block);
+
+        if virt_src_file_block.contains(&dst_file_block) {
+            // OK!
+        } else {
+            eprintln!("Can't get data outside file block");
+            dbg!(dst_file_block.offset >= virt_src_file_block.offset);
+            dbg!(
+                dst_file_block.offset + dst_file_block.size
+                    <= virt_src_file_block.offset + virt_src_file_block.size
+            );
+            dbg!(dst_file_block.offset + dst_file_block.size);
+            dbg!(virt_src_file_block.offset + virt_src_file_block.size);
+            panic!("Can't get data outside file block");
+            data_outside_fileblock += 1;
+            continue 'missing_pieces_loop;
+        }
+
+        let data = read_piece(&mut src_f, virt_src_file_block).expect("Can't read piece");
+        let data_offset = (dst_file_block.offset - virt_src_file_block.offset) as usize; // is positive
+        let data = &data[data_offset..(data_offset + dst_file_block.size as usize)];
+        let computed_hash = get_sha1(data);
+
+        if computed_hash == missing_hash {
+            println!("hashes match!");
+            println!("Writing to {}", dst_filename);
+            let mut dst_f = get_write_file(&preferences, &dst_torrent.properties, dst_filename)
+                .expect(&format!("Can't open file {:?}", &dst_filename));
+            write_piece(&mut dst_f, dst_file_block, &data).expect("Unable to write file");
+            println!("wrote to {}", dst_filename);
+        } else {
+            panic!("hashes don't match");
+        }
     }
+
+    println!("Unavailable pieces: {}", unavailable_pieces);
+    println!("Data outside fileblock: {}", data_outside_fileblock);
 
     println!("Please recheck torrent");
     println!("Zee end");
