@@ -4,7 +4,7 @@ A tool to merge partial downloads in [qBittorrent](https://www.qbittorrent.org/)
 
 Files have to be identical. Overall content of torrent can be different, only identical files will be merged
 
-# Usage
+# Download or build
 ## Building
 Install [Rust](https://www.rust-lang.org/)
 
@@ -16,6 +16,11 @@ cd qbittorrent-merger/
 cargo build --release
 ```
 
+## Download
+
+See releases tab
+
+# Usage
 ## Get torrent hashes from qBittorrent
 
 ![qbittorrent_hash](doc/qbittorrent_hash.PNG)
