@@ -88,11 +88,11 @@ struct TorrentPiece {
 }
 impl TorrentPiece {
     /// Merge multiple consecutive pieces into one big virtual piece
-    fn merge(list: &[TorrentPiece]) -> Option<TorrentPiece> {
+    fn merge(list: &[TorrentPiece]) -> Option<VirtualPiece> {
         let first_piece = list.get(0)?;
         // TODO: handle errors
-        Some(TorrentPiece {
-            idx: first_piece.idx / list.len(),
+        Some(VirtualPiece {
+            offset: first_piece.idx * first_piece.piece_size as usize,
             piece_size: list.len() as u64 * first_piece.piece_size,
         })
     }
@@ -100,26 +100,48 @@ impl TorrentPiece {
 
 fn piece_to_file_block(
     torrent: &Torrent,
-    piece: &TorrentPiece,
+    piece: &Piece,
 ) -> Result<(String, FileBlock), Box<dyn std::error::Error>> {
-    let mut offset = piece.idx as u64 * piece.piece_size;
-    for f in &torrent.content {
-        if offset < f.size {
-            let file_start = piece.idx as u64 * piece.piece_size - offset;
-            dbg!(file_start);
-            // piece is inside file
-            let file_block = FileBlock {
-                offset,
-                size: piece.piece_size,
-            };
-            return Ok((f.name.clone(), file_block));
-        } else {
-            // maybe in next file?
-            offset -= f.size;
+    match *piece {
+        Piece::TorrentPiece(piece) => {
+            let mut offset = piece.idx as u64 * piece.piece_size;
+            for f in &torrent.content {
+                if offset < f.size {
+                    let file_start = piece.idx as u64 * piece.piece_size - offset;
+                    dbg!(file_start);
+                    // piece is inside file
+                    let file_block = FileBlock {
+                        offset,
+                        size: piece.piece_size,
+                    };
+                    return Ok((f.name.clone(), file_block));
+                } else {
+                    // maybe in next file?
+                    offset -= f.size;
+                }
+            }
+
+            Err("Piece outside of torrent".into())
+        }
+        Piece::VirtualPiece(piece) => {
+            let mut offset = piece.offset as u64;
+            for f in &torrent.content {
+                if offset < f.size {
+                    // piece is inside file
+                    let file_block = FileBlock {
+                        offset,
+                        size: piece.piece_size,
+                    };
+                    return Ok((f.name.clone(), file_block));
+                } else {
+                    // maybe in next file?
+                    offset -= f.size;
+                }
+            }
+
+            Err("Piece outside of torrent".into())
         }
     }
-
-    Err("Piece outside of torrent".into())
 }
 
 fn file_block_to_pieces(
@@ -358,7 +380,8 @@ async fn work() -> Result<(), Box<dyn std::error::Error>> {
 
         let missing_hash = dst_torrent.pieces_hashes[dst_piece.idx];
 
-        let (filename, dst_file_block) = piece_to_file_block(&dst_torrent, &dst_piece).unwrap();
+        let (filename, dst_file_block) =
+            piece_to_file_block(&dst_torrent, &Piece::TorrentPiece(dst_piece)).unwrap();
         dbg!(&filename, &dst_file_block);
 
         let src_filename = convert_filename(&same_files, &filename).unwrap();
@@ -382,7 +405,7 @@ async fn work() -> Result<(), Box<dyn std::error::Error>> {
         let virt_src_piece = TorrentPiece::merge(&src_pieces).unwrap();
         dbg!(&virt_src_piece);
         let (_src_filename, virt_src_file_block) =
-            piece_to_file_block(&src_torrent, &virt_src_piece).unwrap();
+            piece_to_file_block(&src_torrent, &Piece::VirtualPiece(virt_src_piece)).unwrap();
         dbg!(virt_src_file_block);
 
         if virt_src_file_block.contains(&dst_file_block) {
