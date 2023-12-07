@@ -1,6 +1,3 @@
-// http://www.bittorrent.org/beps/bep_0003.html
-#![allow(unused_imports)]
-
 use std::collections::HashSet;
 use std::convert::TryInto;
 use std::fs::OpenOptions;
@@ -10,7 +7,7 @@ use std::{collections::HashMap, fs::File};
 use log::{debug, error, info, warn};
 use qbit_rs::model::{Preferences, TorrentContent, TorrentProperty};
 use qbit_rs::{
-    model::{Credential, GetTorrentListArg, PieceState},
+    model::{Credential, PieceState},
     Qbit,
 };
 use sha1::{Digest, Sha1};
@@ -96,7 +93,7 @@ impl TorrentPiece {
     /// Merge multiple consecutive pieces into one big virtual piece
     fn merge(list: &[TorrentPiece]) -> Option<VirtualPiece> {
         let first_piece = list.get(0)?;
-        // TODO: handle errors
+
         Some(VirtualPiece {
             offset: first_piece.idx * first_piece.piece_size as usize,
             piece_size: list.len() as u64 * first_piece.piece_size,
@@ -113,7 +110,7 @@ fn piece_to_file_block(
             let mut offset = piece.idx as u64 * piece.piece_size;
             for f in &torrent.content {
                 if offset < f.size {
-                    let file_start = piece.idx as u64 * piece.piece_size - offset;
+                    //let file_start = piece.idx as u64 * piece.piece_size - offset;
                     // piece is inside file
                     let file_block = FileBlock {
                         offset,
@@ -164,7 +161,6 @@ fn file_block_to_pieces(
                 // offset inside file
                 offset += file_block.offset;
                 let start_idx = (offset / piece_size) as usize;
-                //let end_idx = ((offset + file_block.size) / piece_size) as usize + 1; // TODO: offset+1? offset+block_size-1?
                 let end_idx = ((offset + file_block.size).div_ceil(piece_size)) as usize;
 
                 let result: Vec<TorrentPiece> = (start_idx..end_idx)
@@ -227,13 +223,13 @@ fn get_write_file(
         format!("{}/{}", preferences.temp_path.as_ref().unwrap(), path)
     };
 
-    let f = OpenOptions::new().write(true).open(&path)?;
+    let f = OpenOptions::new().write(true).open(path)?;
     Ok(BufWriter::new(f))
 }
 
 fn write_piece(f: &mut BufWriter<File>, file_block: FileBlock, data: &[u8]) -> std::io::Result<()> {
     f.seek(std::io::SeekFrom::Start(file_block.offset))?;
-    f.write(data)?;
+    f.write_all(data)?;
     f.flush()
 }
 
@@ -348,7 +344,6 @@ async fn work() -> Result<(), Box<dyn std::error::Error>> {
     let src_hash = &args[1]; // completed torrent
     let dst_hash = &args[2]; // incomplete torrent
 
-    // TODO: api.pause_torrents(hashes)
     let src_torrent = Torrent::new(&api, src_hash).await?;
     let dst_torrent = Torrent::new(&api, dst_hash).await?;
     api.pause_torrents(&[dst_torrent.hash.clone()]).await?;
@@ -410,7 +405,7 @@ async fn work() -> Result<(), Box<dyn std::error::Error>> {
             debug!("src_pieces: {:?}", &src_pieces);
 
             for src_piece in &src_pieces {
-                let src_piece_is_available = src_torrent.piece_is_downloaded(&src_piece);
+                let src_piece_is_available = src_torrent.piece_is_downloaded(src_piece);
                 if !src_piece_is_available {
                     warn!("Skipping unavailable piece: {:?}", src_piece);
                     unavailable_pieces += 1;
@@ -419,7 +414,7 @@ async fn work() -> Result<(), Box<dyn std::error::Error>> {
             }
 
             let mut src_f = get_read_file(&preferences, &src_torrent.properties, &src_filename)
-                .expect(&format!("Can't open file {:?}", &src_filename));
+                .unwrap_or_else(|_| panic!("Can't open file {:?}", &src_filename));
             let virt_src_piece = TorrentPiece::merge(&src_pieces).unwrap();
             debug!("virt_src_piece: {:?}", virt_src_piece);
             let (_src_filename, virt_src_file_block) =
@@ -444,8 +439,8 @@ async fn work() -> Result<(), Box<dyn std::error::Error>> {
                 info!("hashes match!");
                 debug!("Writing to {}", dst_filename);
                 let mut dst_f = get_write_file(&preferences, &dst_torrent.properties, dst_filename)
-                    .expect(&format!("Can't open file {:?}", &dst_filename));
-                write_piece(&mut dst_f, dst_file_block, &data).expect("Unable to write file");
+                    .unwrap_or_else(|_| panic!("Can't open file {:?}", &dst_filename));
+                write_piece(&mut dst_f, dst_file_block, data).expect("Unable to write file");
             } else {
                 warn!("hashes don't match");
             }

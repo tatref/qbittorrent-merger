@@ -826,6 +826,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "qbittorrent-merger"
+version = "0.1.0"
+dependencies = [
+ "env_logger",
+ "hex",
+ "log",
+ "qbit-rs",
+ "sha1",
+ "tokio",
+]
+
+[[package]]
 name = "quote"
 version = "1.0.33"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1313,18 +1325,6 @@ dependencies = [
  "pin-project-lite",
  "tokio",
  "tracing",
-]
-
-[[package]]
-name = "torrent-merge"
-version = "0.1.0"
-dependencies = [
- "env_logger",
- "hex",
- "log",
- "qbit-rs",
- "sha1",
- "tokio",
 ]
 
 [[package]]
