@@ -96,7 +96,7 @@ fn file_block_to_piece(
     torrent: &Torrent,
     path: &str,
     file_block: &FileBlock,
-) -> Result<Piece, Box<dyn std::error::Error>> {
+) -> Result<Vec<Piece>, Box<dyn std::error::Error>> {
     let piece_size = torrent.properties.piece_size.unwrap() as u64;
     let mut offset = 0;
     for f in &torrent.content {
@@ -106,10 +106,15 @@ fn file_block_to_piece(
             } else {
                 // offset inside file
                 offset += file_block.offset;
-                let idx = (offset / file_block.size) as usize;
-                let piece_size = file_block.size.div_ceil(piece_size) * piece_size;
-                let piece = Piece { idx, piece_size }; // TODO: piece_size = torrent.properties.piece_size
-                return Ok(piece);
+                let start_idx = (offset / piece_size) as usize;
+                //let end_idx = ((offset + file_block.size) / piece_size) as usize + 1; // TODO: offset+1? offset+block_size-1?
+                let end_idx = ((offset + file_block.size).div_ceil(piece_size)) as usize;
+
+                let result: Vec<Piece> = (start_idx..end_idx)
+                    .map(|idx| Piece { idx, piece_size })
+                    .collect();
+
+                return Ok(result);
             }
         } else {
             offset += f.size;
@@ -283,77 +288,92 @@ async fn work() -> Result<(), Box<dyn std::error::Error>> {
     let preferences = api.get_preferences().await.unwrap();
 
     let src_hash = "9ddec20aec74729ddd100b3f60bfb9a87a5ee3f0";
-    let dest_hash = "3617e650eadd9372c44c8b73b0b95381dd100192";
+    let dst_hash = "3617e650eadd9372c44c8b73b0b95381dd100192";
 
     let src_torrent = Torrent::new(&api, src_hash).await?;
-    let dest_torrent = Torrent::new(&api, dest_hash).await?;
+    let dst_torrent = Torrent::new(&api, dst_hash).await?;
 
-    let same_files = find_same_size_files(&src_torrent, &dest_torrent);
+    println!("src content:");
+    for f in &src_torrent.content {
+        dbg!(f.size, &f.name);
+    }
+    println!("dst content:");
+    for f in &dst_torrent.content {
+        dbg!(f.size, &f.name);
+    }
+
+    let same_files = find_same_size_files(&src_torrent, &dst_torrent);
     dbg!(&same_files);
 
     let _src_filename = &same_files[0].0[0].clone(); // recomputed from torrent content later
-    let dest_filename = &same_files[0].1[0].clone();
+    let dst_filename = &same_files[0].1[0].clone();
 
-    let missing_pieces = get_missing_pieces(&dest_torrent, dest_filename);
-
+    let missing_pieces = get_missing_pieces(&dst_torrent, dst_filename);
+    dbg!(&missing_pieces);
     dbg!(missing_pieces.len());
-    for &missing_piece_idx in &missing_pieces {
+
+    assert_eq!(missing_pieces.len(), 4);
+
+    for &missing_piece_idx in &missing_pieces[1..] {
         let dst_piece = Piece {
             idx: missing_piece_idx,
-            piece_size: dest_torrent.properties.piece_size.unwrap() as u64,
+            piece_size: dst_torrent.properties.piece_size.unwrap() as u64,
         };
         dbg!("missing piece:", dst_piece);
 
-        let missing_hash = dest_torrent.pieces_hashes[dst_piece.idx];
+        let missing_hash = dst_torrent.pieces_hashes[dst_piece.idx];
 
-        let (filename, dst_file_block) = piece_to_file_block(&dest_torrent, &dst_piece).unwrap();
+        let (filename, dst_file_block) = piece_to_file_block(&dst_torrent, &dst_piece).unwrap();
         dbg!(&filename, &dst_file_block);
 
         let src_filename = convert_filename(&same_files, &filename).unwrap();
         dbg!(&filename, &src_filename);
-        let src_piece = file_block_to_piece(&src_torrent, &src_filename, &dst_file_block).unwrap();
-        if src_piece.piece_size != src_torrent.properties.piece_size.unwrap() as u64 {
-            todo!("block spanning multiple pieces");
+        let src_pieces = file_block_to_piece(&src_torrent, &src_filename, &dst_file_block).unwrap();
+        dbg!(&src_pieces);
+
+        for src_piece in &src_pieces {
+            let src_piece_is_available = src_torrent.piece_is_downloaded(&src_piece);
+            dbg!(src_piece_is_available);
+
+            dbg!(&src_piece);
+
+            let mut src_f = get_read_file(&preferences, &src_torrent.properties, &src_filename)
+                .expect(&format!("Can't open file {:?}", &src_filename));
+            let (_src_filename, src_file_block) =
+                piece_to_file_block(&src_torrent, &src_piece).unwrap();
+
+            dbg!(src_file_block);
+
+            if dst_file_block.offset >= src_file_block.offset
+                && dst_file_block.offset + dst_file_block.size
+                    <= src_file_block.offset + src_file_block.size
+            {
+                // OK!
+            } else {
+                panic!("Can't get data outside file block");
+            }
+
+            let data = read_piece(&mut src_f, src_file_block).expect("Can't read piece");
+            let data_offset = (dst_file_block.offset - src_file_block.offset) as usize; // is positive
+            let data = &data[data_offset..(data_offset + dst_file_block.size as usize)];
+            let computed_hash = get_sha1(data);
+
+            if computed_hash == missing_hash {
+                println!("hashes match!");
+                println!("Writing to {}", dst_filename);
+                let mut dst_f = get_write_file(&preferences, &dst_torrent.properties, dst_filename)
+                    .expect(&format!("Can't open file {:?}", &dst_filename));
+                //write_piece(&mut dst_f, dst_file_block, &data).expect("Unable to write file");
+                println!("wrote to {}", dst_filename);
+            } else {
+                panic!("hashes don't match");
+            }
         }
 
-        let src_piece_is_available = src_torrent.piece_is_downloaded(&src_piece);
-        dbg!(src_piece_is_available);
-
-        dbg!(&src_piece);
-
-        let mut src_f = get_read_file(&preferences, &src_torrent.properties, &src_filename)
-            .expect(&format!("Can't open file {:?}", &src_filename));
-        let (_src_filename, src_file_block) =
-            piece_to_file_block(&src_torrent, &src_piece).unwrap();
-
-        dbg!(src_file_block);
-
-        if dst_file_block.offset >= src_file_block.offset
-            && dst_file_block.offset + dst_file_block.size
-                <= src_file_block.offset + src_file_block.size
-        {
-            // OK!
-        } else {
-            panic!("Can't get data outside file block");
-        }
-
-        let data = read_piece(&mut src_f, src_file_block).expect("Can't read piece");
-        let data_offset = (dst_file_block.offset - src_file_block.offset) as usize; // is positive
-        let data = &data[data_offset..(data_offset + dst_file_block.size as usize)];
-        let computed_hash = get_sha1(data);
-
-        if computed_hash == missing_hash {
-            println!("hashes match!");
-            println!("Writing to {}", dest_filename);
-            let mut dst_f = get_write_file(&preferences, &dest_torrent.properties, dest_filename)
-                .expect(&format!("Can't open file {:?}", &dest_filename));
-            //write_piece(&mut dst_f, dst_file_block, &data).expect("Unable to write file");
-            println!("wrote to {}", dest_filename);
-        } else {
-            panic!("hashes don't match");
-        }
+        break;
     }
 
+    println!("Please recheck torrent");
     println!("Zee end");
 
     Ok(())
