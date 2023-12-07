@@ -65,5 +65,3 @@ cargo run --release --bin merge 75439d5de343999ab377c617c2c647902956e282 2dd3f21
 [2023-12-07T22:10:44Z INFO  merge] Data outside file block: 0
 [2023-12-07T22:10:44Z INFO  merge] Please rechecking torrents!
 ```
-
-Here we managed to restore 1056 pieces
