@@ -7,16 +7,18 @@ use std::collections::HashSet;
 use std::convert::TryInto;
 use std::fs::OpenOptions;
 use std::io::{prelude::*, BufReader, BufWriter};
+use std::time::Duration;
 use std::{collections::HashMap, fs::File};
 
 use log::{debug, error, info, warn};
-use qbit_rs::model::{Preferences, TorrentContent, TorrentProperty};
+use qbit_rs::model::{GetTorrentListArg, Preferences, TorrentContent, TorrentProperty};
 use qbit_rs::{
     model::{Credential, PieceState},
     Qbit,
 };
 use sha1::{Digest, Sha1};
 
+#[allow(dead_code)]
 struct Torrent {
     hash: String,
     properties: TorrentProperty,
@@ -367,7 +369,6 @@ async fn merge_torrents(
 
     let src_torrent: Torrent = Torrent::new(&api, src_hash).await?;
     let dst_torrent = Torrent::new(&api, dst_hash).await?;
-    api.pause_torrents(&[dst_torrent.hash.clone()]).await?;
 
     let mut unavailable_pieces = 0;
     let mut data_outside_file_block = 0;
@@ -453,7 +454,7 @@ async fn merge_torrents(
                 continue 'missing_pieces_loop;
             }
 
-            let data = read_piece(&mut src_f, virt_src_file_block).expect("Can't read piece");
+            let data = read_piece(&mut src_f, virt_src_file_block)?;
             let data_offset = (dst_file_block.offset - virt_src_file_block.offset) as usize; // is positive
             let data = &data[data_offset..(data_offset + dst_file_block.size as usize)];
             let computed_hash = get_sha1(data);
@@ -461,8 +462,12 @@ async fn merge_torrents(
             if computed_hash == missing_hash {
                 debug!("hashes match!");
                 debug!("Writing to {}", dst_filename);
-                let mut dst_f = get_write_file(&preferences, &dst_torrent.properties, dst_filename)
-                    .unwrap_or_else(|_| panic!("Can't open file {:?}", &dst_filename));
+                let mut dst_f =
+                    match get_write_file(&preferences, &dst_torrent.properties, dst_filename) {
+                        Ok(f) => f,
+                        Err(_e) => continue,
+                    };
+
                 write_piece(&mut dst_f, dst_file_block, data).expect("Unable to write file");
                 restored_pieces += 1;
             } else {
@@ -475,25 +480,50 @@ async fn merge_torrents(
     info!("Unavailable pieces: {}", unavailable_pieces);
     info!("Data outside file block: {}", data_outside_file_block);
 
-    info!("Please recheck torrents!");
-    //api.recheck_torrents(&[dst_torrent.hash.clone()]).await?;
     Ok(())
 }
 
-async fn work(hashes: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+async fn work(hashes: Option<&[String]>) -> Result<(), Box<dyn std::error::Error>> {
     let credential = Credential::new("admin", "");
     let api = Qbit::new("http://localhost:8080", credential);
 
     let version = api.get_version().await?;
     info!("qBittorrent version: {}", version);
 
+    let hashes: Vec<String> = match hashes {
+        None => api
+            .get_torrent_list(GetTorrentListArg::builder().build())
+            .await?
+            .into_iter()
+            .map(|x| x.hash.unwrap())
+            .collect(),
+        Some(x) => x.to_vec(),
+    };
+    let hashes = hashes.as_slice();
+
+    info!("hashes: {:?}", hashes);
+
+    api.stop_torrents([hashes[1].clone()]).await?;
+    //api.pause_torrents(hashes).await?;
+    info!("plop");
+    std::thread::sleep(Duration::from_secs(1));
+
     // Loop over all couple of hashes
     for hashes in hashes.iter().combinations(2) {
         // Loop over (src, dst), (dst, src)
         for (src_hash, dst_hash) in &[(hashes[0], hashes[1]), (hashes[1], hashes[0])] {
-            merge_torrents(&api, &src_hash, &dst_hash).await?;
+            match merge_torrents(&api, &src_hash, &dst_hash).await {
+                Ok(()) => (),
+                Err(e) => error!("{}", e),
+            }
         }
     }
+
+    api.recheck_torrents(hashes).await?;
+    println!("Rechecking torrents...");
+
+    std::thread::sleep(Duration::from_secs(10));
+    api.start_torrents(hashes).await?;
 
     Ok(())
 }
@@ -503,11 +533,11 @@ async fn main() {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
     let args: Vec<_> = std::env::args().collect();
-    if args.len() < 3 {
-        error!("Usage: {} <complete hash> <incomplete hash>", args[0]);
-        std::process::exit(1);
-    }
-    let hashes = &args[1..];
+    let hashes = if args.len() < 3 {
+        None
+    } else {
+        Some(&args[1..])
+    };
 
     work(hashes).await.unwrap();
 }
