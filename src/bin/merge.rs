@@ -9,12 +9,13 @@ use std::collections::HashSet;
 use std::convert::TryInto;
 use std::fs::OpenOptions;
 use std::io::{prelude::*, BufReader, BufWriter};
+use std::path::PathBuf;
 use std::time::Duration;
 use std::{collections::HashMap, fs::File};
 use tokio::time::sleep;
 
 use log::{debug, error, info, warn};
-use qbit_rs::model::{GetTorrentListArg, Preferences, State, TorrentContent, TorrentProperty};
+use qbit_rs::model::{GetTorrentListArg, State, Torrent, TorrentContent, TorrentProperty};
 use qbit_rs::{
     model::{Credential, PieceState},
     Qbit,
@@ -30,15 +31,16 @@ struct Config {
 }
 
 #[allow(dead_code)]
-struct Torrent {
+struct TorrentInfo {
     hash: String,
     properties: TorrentProperty,
     content: Vec<TorrentContent>,
     pieces_states: Vec<PieceState>,
     pieces_hashes: Vec<[u8; 20]>,
+    torrent: Torrent,
 }
 
-impl Torrent {
+impl TorrentInfo {
     async fn new(api: &Qbit, hash: &str) -> Result<Self, qbit_rs::Error> {
         let pieces_hashes: Vec<[u8; 20]> = api
             .get_torrent_pieces_hashes(hash)
@@ -49,13 +51,24 @@ impl Torrent {
         let pieces_states = api.get_torrent_pieces_states(hash).await?;
         let properties = api.get_torrent_properties(hash).await?;
         let content = api.get_torrent_contents(hash, None).await?;
+        let torrent = api
+            .get_torrent_list(
+                GetTorrentListArg::builder()
+                    .hashes(hash.to_string())
+                    .build(),
+            )
+            .await?
+            .first()
+            .cloned()
+            .unwrap();
 
-        let torrent = Torrent {
+        let torrent = TorrentInfo {
             hash: hash.to_owned(),
             properties,
             content,
             pieces_states,
             pieces_hashes,
+            torrent,
         };
         Ok(torrent)
     }
@@ -128,7 +141,7 @@ impl TorrentPiece {
 }
 
 fn piece_to_file_block(
-    torrent: &Torrent,
+    torrent: &TorrentInfo,
     piece: &Piece,
 ) -> Result<(String, FileBlock), Box<dyn std::error::Error>> {
     match *piece {
@@ -173,7 +186,7 @@ fn piece_to_file_block(
 }
 
 fn file_block_to_pieces(
-    torrent: &Torrent,
+    torrent: &TorrentInfo,
     path: &str,
     file_block: &FileBlock,
 ) -> Result<Vec<TorrentPiece>, Box<dyn std::error::Error>> {
@@ -224,50 +237,50 @@ fn convert_filename(
 }
 
 fn get_read_file(
-    preferences: &Preferences,
-    torrent_property: &TorrentProperty,
-    path: &str,
+    torrent_info: &TorrentInfo,
+    filepath: &str,
     dir_mappings: &HashMap<String, String>,
 ) -> std::io::Result<BufReader<File>> {
-    let path = if torrent_property.pieces_num.unwrap() == torrent_property.pieces_have.unwrap() {
-        format!("{}/{}", torrent_property.save_path.as_ref().unwrap(), path)
-    } else {
-        format!("{}/{}", preferences.temp_path.as_ref().unwrap(), path)
-    };
+    let root = torrent_info
+        .torrent
+        .content_path
+        .clone()
+        .ok_or(std::io::ErrorKind::Other)?;
 
-    let mut new_path = path.clone();
+    let mut new_root = root.clone();
     for (from, to) in dir_mappings {
         let re = Regex::new(from).unwrap();
-        new_path = re.replace(&new_path, to).to_string();
+        new_root = re.replace(&new_root, to).to_string();
     }
-    if path != new_path {
-        info!("file with mapping: {} -> {}", path, new_path);
+    if root != new_root {
+        info!("file with mapping: {} -> {}", root, new_root);
     }
-    let f = OpenOptions::new().read(true).open(new_path)?;
+    let path = PathBuf::from(new_root).parent().unwrap().join(filepath);
+    let f = OpenOptions::new().read(true).open(path)?;
     Ok(BufReader::new(f))
 }
 
 fn get_write_file(
-    preferences: &Preferences,
-    torrent_property: &TorrentProperty,
-    path: &str,
+    torrent_info: &TorrentInfo,
+    filepath: &str,
     dir_mappings: &HashMap<String, String>,
 ) -> std::io::Result<BufWriter<File>> {
-    let path = if torrent_property.pieces_num.unwrap() == torrent_property.pieces_have.unwrap() {
-        format!("{}/{}", torrent_property.save_path.as_ref().unwrap(), path)
-    } else {
-        format!("{}/{}", preferences.temp_path.as_ref().unwrap(), path)
-    };
+    let root = torrent_info
+        .torrent
+        .content_path
+        .clone()
+        .ok_or(std::io::ErrorKind::Other)?;
 
-    let mut new_path = path.clone();
+    let mut new_root = root.clone();
     for (from, to) in dir_mappings {
         let re = Regex::new(from).unwrap();
-        new_path = re.replace(&new_path, to).to_string();
+        new_root = re.replace(&new_root, to).to_string();
     }
-    if path != new_path {
-        info!("file with mapping: {} -> {}", path, new_path);
+    if root != new_root {
+        info!("file with mapping: {} -> {}", root, new_root);
     }
-    let f = OpenOptions::new().write(true).open(new_path)?;
+    let path = PathBuf::from(new_root).parent().unwrap().join(filepath);
+    let f = OpenOptions::new().write(true).open(path)?;
     Ok(BufWriter::new(f))
 }
 
@@ -284,7 +297,7 @@ fn read_piece(f: &mut BufReader<File>, file_block: FileBlock) -> std::io::Result
     Ok(buf)
 }
 
-fn find_same_size_files(t1: &Torrent, t2: &Torrent) -> Vec<(Vec<String>, Vec<String>)> {
+fn find_same_size_files(t1: &TorrentInfo, t2: &TorrentInfo) -> Vec<(Vec<String>, Vec<String>)> {
     let mut t1_files: HashMap<u64, Vec<String>> = HashMap::new();
     for f in t1.content.iter() {
         let size = f.size;
@@ -314,7 +327,7 @@ fn find_same_size_files(t1: &Torrent, t2: &Torrent) -> Vec<(Vec<String>, Vec<Str
     common_files
 }
 
-fn get_missing_pieces(torrent: &Torrent, path: &str) -> Vec<usize> {
+fn get_missing_pieces(torrent: &TorrentInfo, path: &str) -> Vec<usize> {
     let piece_size = torrent.properties.piece_size.unwrap() as u64;
 
     let offset = get_file_offset(&torrent.content, path).unwrap();
@@ -392,13 +405,13 @@ async fn merge_torrents(
     dst_hash: &str,
     dir_mappings: &HashMap<String, String>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let preferences = api.get_preferences().await.unwrap();
+    //let preferences = api.get_preferences().await.unwrap();
 
     info!("src_hash: {}", src_hash);
     info!("dst_hash: {}", dst_hash);
 
-    let src_torrent: Torrent = Torrent::new(&api, src_hash).await?;
-    let dst_torrent = Torrent::new(&api, dst_hash).await?;
+    let src_torrent: TorrentInfo = TorrentInfo::new(&api, src_hash).await?;
+    let dst_torrent = TorrentInfo::new(&api, dst_hash).await?;
 
     let mut unavailable_pieces = 0;
     let mut data_outside_file_block = 0;
@@ -471,13 +484,8 @@ async fn merge_torrents(
                 }
             }
 
-            let mut src_f = get_read_file(
-                &preferences,
-                &src_torrent.properties,
-                &src_filename,
-                dir_mappings,
-            )
-            .unwrap_or_else(|_| panic!("Can't open file {:?}", &src_filename));
+            let mut src_f = get_read_file(&src_torrent, &src_filename, dir_mappings)
+                .unwrap_or_else(|_| panic!("Can't open file {:?}", &src_filename));
             let virt_src_piece = TorrentPiece::merge(&src_pieces).unwrap();
             debug!("virt_src_piece: {:?}", virt_src_piece);
             let (_src_filename, virt_src_file_block) =
@@ -499,14 +507,9 @@ async fn merge_torrents(
             let computed_hash = get_sha1(data);
 
             if computed_hash == missing_hash {
-                debug!("hashes match!");
+                debug!("pieces hashes match!");
                 debug!("Writing to {}", dst_filename);
-                let mut dst_f = match get_write_file(
-                    &preferences,
-                    &dst_torrent.properties,
-                    dst_filename,
-                    dir_mappings,
-                ) {
+                let mut dst_f = match get_write_file(&dst_torrent, dst_filename, dir_mappings) {
                     Ok(f) => f,
                     Err(_e) => continue,
                 };
@@ -514,7 +517,7 @@ async fn merge_torrents(
                 write_piece(&mut dst_f, dst_file_block, data).expect("Unable to write file");
                 restored_pieces += 1;
             } else {
-                warn!("hashes don't match");
+                warn!("pieces hashes don't match");
             }
         }
     }
@@ -562,7 +565,7 @@ async fn work(config: &Config, hashes: &[String]) -> Result<(), Box<dyn std::err
             .iter()
             .filter_map(|t| t.state.clone())
             .collect();
-        dbg!(&torrent_states);
+        //dbg!(&torrent_states);
 
         if torrent_states
             .iter()
