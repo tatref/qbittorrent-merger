@@ -3,20 +3,31 @@
 //
 
 use itertools::Itertools;
+use regex::Regex;
+use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::convert::TryInto;
 use std::fs::OpenOptions;
 use std::io::{prelude::*, BufReader, BufWriter};
 use std::time::Duration;
 use std::{collections::HashMap, fs::File};
+use tokio::time::sleep;
 
 use log::{debug, error, info, warn};
-use qbit_rs::model::{GetTorrentListArg, Preferences, TorrentContent, TorrentProperty};
+use qbit_rs::model::{GetTorrentListArg, Preferences, State, TorrentContent, TorrentProperty};
 use qbit_rs::{
     model::{Credential, PieceState},
     Qbit,
 };
 use sha1::{Digest, Sha1};
+
+#[derive(Debug, Serialize, Deserialize)]
+struct Config {
+    host: String,
+    username: String,
+    password: String,
+    dir_mappings: HashMap<String, String>,
+}
 
 #[allow(dead_code)]
 struct Torrent {
@@ -216,6 +227,7 @@ fn get_read_file(
     preferences: &Preferences,
     torrent_property: &TorrentProperty,
     path: &str,
+    dir_mappings: &HashMap<String, String>,
 ) -> std::io::Result<BufReader<File>> {
     let path = if torrent_property.pieces_num.unwrap() == torrent_property.pieces_have.unwrap() {
         format!("{}/{}", torrent_property.save_path.as_ref().unwrap(), path)
@@ -223,7 +235,15 @@ fn get_read_file(
         format!("{}/{}", preferences.temp_path.as_ref().unwrap(), path)
     };
 
-    let f = OpenOptions::new().read(true).open(path)?;
+    let mut new_path = path.clone();
+    for (from, to) in dir_mappings {
+        let re = Regex::new(from).unwrap();
+        new_path = re.replace(&new_path, to).to_string();
+    }
+    if path != new_path {
+        info!("file with mapping: {} -> {}", path, new_path);
+    }
+    let f = OpenOptions::new().read(true).open(new_path)?;
     Ok(BufReader::new(f))
 }
 
@@ -231,6 +251,7 @@ fn get_write_file(
     preferences: &Preferences,
     torrent_property: &TorrentProperty,
     path: &str,
+    dir_mappings: &HashMap<String, String>,
 ) -> std::io::Result<BufWriter<File>> {
     let path = if torrent_property.pieces_num.unwrap() == torrent_property.pieces_have.unwrap() {
         format!("{}/{}", torrent_property.save_path.as_ref().unwrap(), path)
@@ -238,7 +259,15 @@ fn get_write_file(
         format!("{}/{}", preferences.temp_path.as_ref().unwrap(), path)
     };
 
-    let f = OpenOptions::new().write(true).open(path)?;
+    let mut new_path = path.clone();
+    for (from, to) in dir_mappings {
+        let re = Regex::new(from).unwrap();
+        new_path = re.replace(&new_path, to).to_string();
+    }
+    if path != new_path {
+        info!("file with mapping: {} -> {}", path, new_path);
+    }
+    let f = OpenOptions::new().write(true).open(new_path)?;
     Ok(BufWriter::new(f))
 }
 
@@ -361,6 +390,7 @@ async fn merge_torrents(
     api: &Qbit,
     src_hash: &str,
     dst_hash: &str,
+    dir_mappings: &HashMap<String, String>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let preferences = api.get_preferences().await.unwrap();
 
@@ -378,20 +408,24 @@ async fn merge_torrents(
         "src_torrent.piece_size={}",
         src_torrent.properties.piece_size.unwrap()
     );
-    info!("src content:");
+    debug!("src content:");
     for f in &src_torrent.content {
-        info!("{:10} {}", f.size, &f.name);
+        debug!("{:10} {}", f.size, &f.name);
     }
     debug!(
         "dst_torrent.piece_size={}",
         dst_torrent.properties.piece_size.unwrap()
     );
-    info!("dst content:");
+    debug!("dst content:");
     for f in &dst_torrent.content {
-        info!("{:10} {}", f.size, &f.name);
+        debug!("{:10} {}", f.size, &f.name);
     }
 
     let same_files = find_same_size_files(&src_torrent, &dst_torrent);
+    if same_files.len() == 0 {
+        info!("No identical file found");
+        return Ok(());
+    }
     info!("same files: {:?}", &same_files);
 
     for same_file in &same_files {
@@ -437,8 +471,13 @@ async fn merge_torrents(
                 }
             }
 
-            let mut src_f = get_read_file(&preferences, &src_torrent.properties, &src_filename)
-                .unwrap_or_else(|_| panic!("Can't open file {:?}", &src_filename));
+            let mut src_f = get_read_file(
+                &preferences,
+                &src_torrent.properties,
+                &src_filename,
+                dir_mappings,
+            )
+            .unwrap_or_else(|_| panic!("Can't open file {:?}", &src_filename));
             let virt_src_piece = TorrentPiece::merge(&src_pieces).unwrap();
             debug!("virt_src_piece: {:?}", virt_src_piece);
             let (_src_filename, virt_src_file_block) =
@@ -462,11 +501,15 @@ async fn merge_torrents(
             if computed_hash == missing_hash {
                 debug!("hashes match!");
                 debug!("Writing to {}", dst_filename);
-                let mut dst_f =
-                    match get_write_file(&preferences, &dst_torrent.properties, dst_filename) {
-                        Ok(f) => f,
-                        Err(_e) => continue,
-                    };
+                let mut dst_f = match get_write_file(
+                    &preferences,
+                    &dst_torrent.properties,
+                    dst_filename,
+                    dir_mappings,
+                ) {
+                    Ok(f) => f,
+                    Err(_e) => continue,
+                };
 
                 write_piece(&mut dst_f, dst_file_block, data).expect("Unable to write file");
                 restored_pieces += 1;
@@ -483,36 +526,22 @@ async fn merge_torrents(
     Ok(())
 }
 
-async fn work(hashes: Option<&[String]>) -> Result<(), Box<dyn std::error::Error>> {
-    let credential = Credential::new("admin", "");
-    let api = Qbit::new("http://localhost:8080", credential);
+async fn work(config: &Config, hashes: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    let credential = Credential::new(&config.username, &config.password);
+    let api = Qbit::new(config.host.as_str(), credential);
 
     let version = api.get_version().await?;
     info!("qBittorrent version: {}", version);
-
-    let hashes: Vec<String> = match hashes {
-        None => api
-            .get_torrent_list(GetTorrentListArg::builder().build())
-            .await?
-            .into_iter()
-            .map(|x| x.hash.unwrap())
-            .collect(),
-        Some(x) => x.to_vec(),
-    };
-    let hashes = hashes.as_slice();
-
     info!("hashes: {:?}", hashes);
 
     api.stop_torrents([hashes[1].clone()]).await?;
-    //api.pause_torrents(hashes).await?;
-    info!("plop");
     std::thread::sleep(Duration::from_secs(1));
 
     // Loop over all couple of hashes
     for hashes in hashes.iter().combinations(2) {
         // Loop over (src, dst), (dst, src)
         for (src_hash, dst_hash) in &[(hashes[0], hashes[1]), (hashes[1], hashes[0])] {
-            match merge_torrents(&api, &src_hash, &dst_hash).await {
+            match merge_torrents(&api, &src_hash, &dst_hash, &config.dir_mappings).await {
                 Ok(()) => (),
                 Err(e) => error!("{}", e),
             }
@@ -521,8 +550,31 @@ async fn work(hashes: Option<&[String]>) -> Result<(), Box<dyn std::error::Error
 
     api.recheck_torrents(hashes).await?;
     println!("Rechecking torrents...");
+    sleep(Duration::from_secs(1)).await;
 
-    std::thread::sleep(Duration::from_secs(10));
+    loop {
+        let torrent_list_arg = GetTorrentListArg::builder()
+            .hashes(hashes.join("|"))
+            .build();
+
+        let torrent_states = api.get_torrent_list(torrent_list_arg).await.unwrap();
+        let torrent_states: Vec<_> = torrent_states
+            .iter()
+            .filter_map(|t| t.state.clone())
+            .collect();
+        dbg!(&torrent_states);
+
+        if torrent_states
+            .iter()
+            .any(|state| state == &State::CheckingDL || state == &State::CheckingUP)
+        {
+            sleep(Duration::from_secs(1)).await;
+            continue;
+        } else {
+            break;
+        }
+    }
+
     api.start_torrents(hashes).await?;
 
     Ok(())
@@ -533,11 +585,12 @@ async fn main() {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
     let args: Vec<_> = std::env::args().collect();
-    let hashes = if args.len() < 3 {
-        None
-    } else {
-        Some(&args[1..])
-    };
+    if args.len() < 3 {
+        println!("Usage: {} hash1 hash2 ...", args[0]);
+        std::process::exit(1);
+    }
+    let config: Config = serde_json::from_reader(File::open("config.json").unwrap()).unwrap();
+    let hashes = &args[1..];
 
-    work(hashes).await.unwrap();
+    work(&config, hashes).await.unwrap();
 }

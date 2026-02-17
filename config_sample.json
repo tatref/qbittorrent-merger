@@ -1,0 +1,9 @@
+{
+	"host": "http://192.168.0.100",
+	"username": "admin",
+	"password": "admin",
+	"dir_mappings": {
+		"/some/dir": "/some/other/dir",
+		"/another/dir": "/some/other/dir2"
+	}
+}
