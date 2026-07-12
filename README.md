@@ -31,9 +31,11 @@ Piece hashes are checked before copying data to files, so mismatching source/des
 
 ## API access
 
-Enable the API, and enable auth bypass for localhost (password is not handled yet)
+Enable the API
 
 ![qbittorrent_api](doc/qbittorrent_api.PNG)
+
+Copy `config_sample.json` to `config.json`, and fill-in the API login
 
 ## Run the tool
 
