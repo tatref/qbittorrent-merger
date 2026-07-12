@@ -21,7 +21,8 @@ use log::{debug, error, info, warn};
 /// 3) get the file offset for the piece in the src torrent, and check if it is downloaded
 /// 4) convert to piece in the dst torrent
 /// 5) convert to file offset in the dst torrent
-/// 6) Copy data from src to dst files
+/// 6) check if sha matches
+/// 7) Copy data from src to dst files
 ///
 /// Careful with:
 /// * Pieces can have different sizes between torrents
@@ -131,7 +132,10 @@ async fn merge_torrents(
                 continue 'missing_pieces_loop;
             }
 
-            let data = read_piece(&mut src_f, virt_src_file_block)?;
+            let data = match read_piece(&mut src_f, virt_src_file_block) {
+                Ok(x) => x,
+                Err(_) => continue 'missing_pieces_loop,
+            };
             let data_offset = (dst_file_block.offset - virt_src_file_block.offset) as usize; // is positive
             let data = &data[data_offset..(data_offset + dst_file_block.size as usize)];
             let computed_hash = get_sha1(data);
